@@ -6,6 +6,7 @@
 !.eslintrc.json
 
 output
+output.bak
 generated-docs
 bower_components
 
