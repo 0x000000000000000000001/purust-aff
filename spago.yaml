@@ -39,6 +39,9 @@ package:
       - tailrec
 
 workspace:
+  backend:
+    cmd: ../purust/bin/purust
+    args: [--source, output, --out, output/purust_output]
   packageSet:
     registry: 77.7.0
   extraPackages:

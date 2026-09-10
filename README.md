@@ -48,3 +48,36 @@ You can contribute to `aff` in several ways:
 2. If you would like to contribute code, tests, or documentation, please [read the contributor guide](./CONTRIBUTING.md). It's a short, helpful introduction to contributing to this library, including development instructions.
 
 3. If you have written a library, tutorial, guide, or other resource based on this package, please share it on the [PureScript Discourse](https://discourse.purescript.org)! Writing libraries and learning resources are a great way to help this library succeed.
+
+## Rust backend
+
+Use the sibling Purust compiler with `--threaded`. Generated values use atomic
+shared ownership and thread-safe callbacks; the Aff interpreter uses Tokio for
+waiting and asynchronous resumptions. Fiber startup runs synchronously until the
+first suspension. Timers resume in deadline/registration order, and foreign
+callbacks can complete on different workers.
+
+The generated entry point keeps the runtime alive until all active fibers finish,
+including children and grandchildren that outlive their parents. Unhandled Aff
+errors and Rust panics produce a failing process after the remaining children
+finish. `supervise` retains its own cancellation semantics.
+
+Run the Rust tests with:
+
+```sh
+./bin/test -c
+```
+
+This rebuilds Purust using its local Spago, regenerates TAST with the sibling
+PureScript fork, compiles Rust and checks the output. Set `PURS` to select another
+TAST-enabled compiler. `./bin/test --smoke` runs the small initial scenario.
+
+The full runner preserves all 45 active tests in `test/Test/Main.purs`, including
+cancellation, bracket, supervision, parallel races, recursion and the 100,000-item
+stack test. It also runs the unchanged Go AVar stress test, real worker-thread
+Ref/AVar integration, supervision of an unreferenced `never` fiber, and
+parent/child lifetime scenarios. The scheduler-size test
+was already commented out in the upstream source; no active assertion is skipped.
+
+The Rust runtime does not collect strong reference cycles automatically. As with
+other `Rc`/`Arc` values, a strong self-reference must be broken to release it.

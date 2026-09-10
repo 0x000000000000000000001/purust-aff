@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+CLEAN=0
+SMOKE=0
+for arg in "$@"; do
+  case "$arg" in
+    -c|--clean) CLEAN=1 ;;
+    --smoke) SMOKE=1 ;;
+    *) echo "Usage: bin/test [-c|--clean] [--smoke]" >&2; exit 2 ;;
+  esac
+done
+
+COMPILER_DIR="$(cd ../purust && pwd)"
+SPAGO_BIN="$COMPILER_DIR/node_modules/.bin/spago"
+if [ ! -x "$SPAGO_BIN" ]; then
+  printf 'Missing Spago dependency. Run npm install in %s.\n' "$COMPILER_DIR" >&2
+  exit 1
+fi
+if [ "$CLEAN" = 1 ]; then
+  echo "=== Recompiling purust ==="
+  (cd "$COMPILER_DIR" && npm run build)
+fi
+if [ -n "${PURS:-}" ]; then
+  PURS_BIN="$(command -v "$PURS")"
+else
+  FORK_BUILDS=("$COMPILER_DIR"/../../purescript/.stack-work/dist/*/*/build/purs/purs)
+  if [ "${#FORK_BUILDS[@]}" = 1 ] && [ -x "${FORK_BUILDS[0]}" ]; then
+    PURS_BIN="${FORK_BUILDS[0]}"
+  else
+    PURS_BIN="$(command -v purs)"
+  fi
+fi
+export PATH="$(dirname "$PURS_BIN"):$PATH"
+
+rm -rf output
+if [ "$CLEAN" = 1 ]; then rm -rf .spago .cache; fi
+
+MAIN=Test.Main
+if [ "$SMOKE" = 1 ]; then MAIN=Test.Smoke; fi
+echo "=== Building TAST and generating concurrent Rust ==="
+"$SPAGO_BIN" build --backend-args=--main --backend-args="$MAIN" --backend-args=--threaded
+node -e 'const fs = require("node:fs"); const m = JSON.parse(fs.readFileSync("output/Test.Main/corefn.json", "utf8")); if (!Array.isArray(m.dataDecls)) { console.error("A TAST-enabled PureScript fork is required; set PURS to its executable."); process.exit(1); }'
+
+run_suite() {
+  local label="$1" expected="$2"
+  cargo build --manifest-path output/purust_output/Cargo.toml
+  echo "=== Running $label ==="
+  # Node is already required by the compiler; bound hangs without extra tools.
+  local status=0
+  node -e 'const r = require("node:child_process").spawnSync(process.argv[1], [], { stdio: "inherit", timeout: 120000 }); if (r.error) console.error(r.error.message); process.exit(r.status ?? 1);' \
+    output/purust_output/target/debug/purust_output > "output/$label.stdout" 2> "output/$label.stderr" || status=$?
+  cat "output/$label.stdout"
+  if [ "$status" -ne 0 ] || [ -s "output/$label.stderr" ]; then
+    cat "output/$label.stderr" >&2
+    printf '[FAILED] %s exited with status %s\n' "$label" "$status" >&2
+    exit 1
+  fi
+  diff -u "$expected" "output/$label.stdout"
+}
+
+if [ "$SMOKE" = 1 ]; then
+  run_suite smoke test/expected-smoke.stdout
+  echo "Summary: Aff smoke passed."
+else
+  run_suite aff test/expected-main.stdout
+  "$COMPILER_DIR/bin/purust" --source output --out output/purust_output --main Test.Concurrency --threaded
+  run_suite concurrency test/expected-concurrency.stdout
+  "$COMPILER_DIR/bin/purust" --source output --out output/purust_output --main Test.Lifetime --threaded
+  run_suite lifetime test/expected-lifetime.stdout
+  for scenario in 1 2 3; do
+    status=0
+    node -e 'const r = require("node:child_process").spawnSync(process.argv[1], [process.argv[2]], { stdio: "inherit", timeout: 120000 }); if (r.error) console.error(r.error.message); process.exit(r.status ?? 1);' \
+      output/purust_output/target/debug/purust_output "$scenario" > "output/lifetime-failure-$scenario.stdout" 2> "output/lifetime-failure-$scenario.stderr" || status=$?
+    cat "output/lifetime-failure-$scenario.stdout"
+    if [ "$status" -ne 101 ]; then
+      cat "output/lifetime-failure-$scenario.stderr" >&2
+      printf '[FAILED] lifetime error %s: expected exit 101, got %s\n' "$scenario" "$status" >&2
+      exit 1
+    fi
+    expected=test/expected-lifetime-failure.stdout
+    if [ "$scenario" = 3 ]; then expected=test/expected-lifetime.stdout; fi
+    diff -u "$expected" "output/lifetime-failure-$scenario.stdout"
+    if [ "$scenario" != 1 ]; then
+      failure_output=$(< "output/lifetime-failure-$scenario.stderr")
+      if [[ "$failure_output" != *'intentional lifetime Rust panic'* ]]; then
+        cat "output/lifetime-failure-$scenario.stderr" >&2
+        exit 1
+      fi
+    fi
+    printf '[OK] lifetime failure %s reaches process after remaining children finish\n' "$scenario"
+  done
+  echo "Summary: 45 Aff checks, concurrent Ref/AVar integration and child lifetime checks passed."
+fi
