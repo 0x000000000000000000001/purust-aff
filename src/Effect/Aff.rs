@@ -227,6 +227,15 @@ pub fn purust_aff_run_main(main: impl FnOnce() -> AffValue) {
         std::panic::resume_unwind(panic);
     }
     if let Err(error) = result {
+        // Report only at the outer boundary, after all fibers have finished.
+        // Handled exceptions stay silent; a failed write must preserve the error.
+        use std::io::Write;
+        let message = Purs_Effect_Exception::Effect_Exception_showErrorImpl(error.clone());
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "{}",
+            purust_core::purust_string_to_utf8_lossy(&message)
+        );
         Purs_Effect_Exception::purust_exception_raise(error);
     }
 }

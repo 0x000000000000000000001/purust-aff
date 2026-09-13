@@ -91,5 +91,7 @@ else
     fi
     printf '[OK] lifetime failure %s reaches process after remaining children finish\n' "$scenario"
   done
-  echo "Summary: 45 Aff checks, concurrent Ref/AVar integration and child lifetime checks passed."
+  echo "=== Checking uncaught error reporting with fresh TAST ==="
+  PURS="$PURS_BIN" node test/error-reporting.mjs
+  echo "Summary: 45 Aff checks, concurrent Ref/AVar integration, child lifetime checks and 9 error-reporting scenarios passed."
 fi
