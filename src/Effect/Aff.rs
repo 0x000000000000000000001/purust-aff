@@ -139,11 +139,12 @@ impl AffUtil {
 }
 
 struct AffRuntime {
+    microtasks: Arc<purust_core::microtasks::Queue>,
     handle: tokio::runtime::Handle,
     next_id: AtomicUsize,
     active: AtomicUsize,
     fibers: Mutex<BTreeMap<usize, Arc<AffFiber>>>,
-    changed: tokio::sync::Notify,
+    changed: Arc<tokio::sync::Notify>,
     errors: Mutex<BTreeMap<usize, AffValue>>,
     timers: Mutex<BTreeMap<(tokio::time::Instant, usize), AffCallback>>,
     timer_changed: tokio::sync::Notify,
@@ -187,12 +188,15 @@ pub fn purust_aff_run_main(main: impl FnOnce() -> AffValue) {
         .enable_all()
         .build()
         .unwrap();
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let wake = changed.clone();
     let runtime = Arc::new(AffRuntime {
+        microtasks: purust_core::microtasks::Queue::new(move || wake.notify_one()),
         handle: executor.handle().clone(),
         next_id: AtomicUsize::new(1),
         active: AtomicUsize::new(0),
         fibers: Mutex::new(BTreeMap::new()),
-        changed: tokio::sync::Notify::new(),
+        changed,
         errors: Mutex::new(BTreeMap::new()),
         timers: Mutex::new(BTreeMap::new()),
         timer_changed: tokio::sync::Notify::new(),
@@ -202,7 +206,7 @@ pub fn purust_aff_run_main(main: impl FnOnce() -> AffValue) {
     let result = executor.block_on(async {
         let _scope = AffRuntimeScope::enter(runtime.clone());
         let main_result =
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| aff_try(main))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.microtasks.turn(|| aff_try(main)))) {
                 Ok(result) => result,
                 Err(panic) => {
                     aff_record_panic(&runtime, panic);
@@ -211,7 +215,15 @@ pub fn purust_aff_run_main(main: impl FnOnce() -> AffValue) {
             };
         loop {
             let changed = runtime.changed.notified();
-            if runtime.active.load(Ordering::Acquire) == 0 {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| aff_try(|| {
+                runtime.microtasks.drain();
+                crate::Value::Unit
+            }))) {
+                Ok(Err(error)) => { runtime.errors.lock().unwrap().insert(0, error); }
+                Err(panic) => aff_record_panic(&runtime, panic),
+                _ => {},
+            }
+            if runtime.active.load(Ordering::Acquire) == 0 && !runtime.microtasks.has_jobs() {
                 break;
             }
             changed.await;
@@ -467,7 +479,7 @@ impl AffFiber {
     }
     fn drive(self: &Arc<Self>) {
         if let Err(panic) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.drive_inner()))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.runtime.microtasks.turn(|| self.drive_inner())))
         {
             aff_record_panic(&self.runtime, panic);
             let _scope = AffRuntimeScope::enter(self.runtime.clone());
