@@ -30,7 +30,7 @@ function select(name) {
   if (name === 'Prim' || name.startsWith('Prim.') || selected.has(name)) return;
   assert.ok(index.has(name), name); selected.set(name, index.get(name).path); index.get(name).depends.forEach(select);
 }
-const suites = [['Test.Main', 'main'], ['Test.Concurrency', 'concurrency'], ['Test.Lifetime', 'lifetime']];
+const suites = [['Test.Main', 'main'], ['Test.Concurrency', 'concurrency'], ['Test.Lifetime', 'lifetime'], ['Test.NativeIO', 'native-io']];
 suites.forEach(([name]) => select(name));
 const fork = resolve(compiler, '../../purescript/.stack-work/dist');
 const candidates = globSync('**/build/purs/purs', { cwd: fork });
@@ -69,8 +69,13 @@ try {
       assert.equal(result.stdout, readFileSync(join(tests, scenario === 3 ? 'expected-lifetime.stdout' : 'expected-lifetime-failure.stdout'), 'utf8'));
       if (scenario !== 1) assert.ok(result.stderr.includes('intentional lifetime Rust panic'));
     }
+    if (label === 'native-io') for (const scenario of [1, 2]) {
+      const result = run('native-io-failure-' + scenario, binary, [String(scenario)], 101);
+      assert.equal(result.stdout, scenario === 1 ? readFileSync(join(tests, 'expected-native-io.stdout'), 'utf8') : '[OK] native IO parent returned\n');
+      assert.ok(result.stderr.includes('intentional native IO ' + (scenario === 1 ? 'future' : 'callback') + ' panic'));
+    }
   }
   for (const { path, sha256 } of report.inputs) assert.equal(hash(path), sha256, path);
   report.complete = true;
-  console.log('45 Aff checks, concurrent Ref/AVar integration and lifetime success/failures passed.');
+  console.log('45 Aff checks, concurrent Ref/AVar, lifetime and tracked native IO success/failures passed.');
 } finally { save(); }
