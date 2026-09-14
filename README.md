@@ -54,13 +54,18 @@ You can contribute to `aff` in several ways:
 Use the sibling Purust compiler with `--threaded`. Generated values use atomic
 shared ownership and thread-safe callbacks; the Aff interpreter uses Tokio for
 waiting and asynchronous resumptions. Fiber startup runs synchronously until the
-first suspension. Timers resume in deadline/registration order, and foreign
-callbacks can complete on different workers.
+first suspension. Expired timers are dispatched in deadline/registration order
+to independent Tokio blocking tasks, so synchronous CPU work after a delay can
+run in parallel without blocking the timer loop or the async workers. A delay
+always suspends, even when its callback arrives during registration. Completion
+order between independent fibers is unspecified. Foreign callbacks can also
+complete on different workers.
 
 The generated entry point keeps the runtime alive until all active fibers finish,
 including children and grandchildren that outlive their parents. Unhandled Aff
-errors and Rust panics produce a failing process after the remaining children
-finish. `supervise` retains its own cancellation semantics.
+errors produce a failing process after the remaining children finish. A Rust
+panic is fatal without waiting for suspended children, including `never` fibers.
+`supervise` retains its own cancellation semantics.
 
 Run the Rust tests with:
 
@@ -75,9 +80,13 @@ TAST-enabled compiler. `./bin/test --smoke` runs the small initial scenario.
 The full runner preserves all 45 active tests in `test/Test/Main.purs`, including
 cancellation, bracket, supervision, parallel races, recursion and the 100,000-item
 stack test. It also runs the unchanged Go AVar stress test, real worker-thread
-Ref/AVar integration, supervision of an unreferenced `never` fiber, and
+Ref/AVar integration, overlapping resumptions after zero and positive delays,
+supervision of an unreferenced `never` fiber, and
 parent/child lifetime scenarios. The scheduler-size test
 was already commented out in the upstream source; no active assertion is skipped.
+Parallel checks use joins and gates to synchronize branches, without assuming
+an order of completion between independent timers. Rust unit tests force an
+early callback to verify the delay handoff and preserve synchronous native waits.
 
 The Rust runtime does not collect strong reference cycles automatically. As with
 other `Rc`/`Arc` values, a strong self-reference must be broken to release it.

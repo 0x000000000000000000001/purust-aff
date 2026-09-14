@@ -17,7 +17,10 @@ enum AffNode {
     Catch(AffNodeRef, AffValue),
     Sync(AffValue),
     Async(AffValue),
-    NativeAsync(Arc<dyn Fn(AffCallback) -> AffCancel + Send + Sync>),
+    NativeAsync {
+        yield_after_registration: bool,
+        build: Arc<dyn Fn(AffCallback) -> AffCancel + Send + Sync>,
+    },
     Bracket(AffNodeRef, AffValue, AffValue),
     Fork(bool, AffNodeRef),
     Sequential(AffNodeRef),
@@ -589,7 +592,24 @@ impl AffFiber {
             let step =
                 std::mem::replace(&mut machine.step, AffStep::Result(Ok(crate::Value::Unit)));
             match step {
-                AffStep::Node(node) => self.instruction(&mut machine, node),
+                AffStep::Node(node) => {
+                    if self.instruction(&mut machine, node) {
+                        // Even a zero-delay callback can arrive during registration.
+                        // Publish the suspension before consuming that event, so
+                        // the continuation cannot run on the launching fiber's stack.
+                        let ready = {
+                            let mut state = self.state.lock().unwrap();
+                            state.machine = Some(machine);
+                            state.running = false;
+                            !state.events.is_empty()
+                        };
+                        if ready {
+                            let fiber = self.clone();
+                            self.runtime.handle.spawn_blocking(move || fiber.drive());
+                        }
+                        return;
+                    }
+                }
                 AffStep::Result(result) => {
                     if let Some(frame) = machine.frames.pop() {
                         self.unwind(&mut machine, frame, result);
@@ -605,7 +625,7 @@ impl AffFiber {
             }
         }
     }
-    fn instruction(self: &Arc<Self>, machine: &mut AffMachine, node: AffNodeRef) {
+    fn instruction(self: &Arc<Self>, machine: &mut AffMachine, node: AffNodeRef) -> bool {
         let interrupt = usize::from(machine.interrupt.is_some());
         match &node.node {
             AffNode::Pure(value) => machine.step = AffStep::Result(Ok(value.clone())),
@@ -676,7 +696,7 @@ impl AffFiber {
                     }
                 }
             }
-            AffNode::NativeAsync(build) => {
+            AffNode::NativeAsync { yield_after_registration, build } => {
                 let tick = machine.tick;
                 let fiber = self.clone();
                 let callback: AffCallback =
@@ -685,6 +705,7 @@ impl AffFiber {
                     tick,
                     cancel: build(callback),
                 };
+                return *yield_after_registration;
             }
             AffNode::Sequential(par) => {
                 let tick = machine.tick;
@@ -700,6 +721,7 @@ impl AffFiber {
                 panic!("ParAff must be consumed through sequential")
             }
         }
+        false
     }
     fn unwind(&self, machine: &mut AffMachine, frame: AffFrame, result: AffResult) {
         let now = usize::from(machine.interrupt.is_some());
@@ -931,8 +953,9 @@ pub fn Effect_Aff__makeSupervisedFiber() -> AffValue {
         })
     })))
 }
-// Expired timers resume in registration/deadline order, including when a busy
-// runtime wakes several at once. Foreign makeAff callbacks remain independent.
+// Dispatch expired timers in deadline/registration order. A continuation can
+// perform arbitrary synchronous CPU work, so it must not run on the timer
+// loop or occupy an async worker needed to wake other fibers.
 async fn aff_timer_loop(runtime: Arc<AffRuntime>) {
     loop {
         let changed = runtime.timer_changed.notified();
@@ -947,7 +970,7 @@ async fn aff_timer_loop(runtime: Arc<AffRuntime>) {
             }
         };
         if let Some(callback) = ready {
-            callback(Ok(crate::Value::Unit));
+            runtime.handle.spawn_blocking(move || callback(Ok(crate::Value::Unit)));
         } else if let Some(deadline) = deadline {
             tokio::select! { _ = tokio::time::sleep_until(deadline) => {}, _ = changed => {} }
         } else {
@@ -960,25 +983,28 @@ pub fn Effect_Aff__delay() -> AffValue {
     crate::Value::Func2(purust_core::Func2::Shared(Arc::new(
         |_right, milliseconds| {
             let milliseconds = milliseconds.unwrap_number();
-            aff_box(AffNode::NativeAsync(Arc::new(move |callback| {
-                let runtime = aff_runtime();
-                let duration = std::time::Duration::from_secs_f64(if milliseconds.is_finite() {
-                    milliseconds.max(0.0) / 1000.0
-                } else {
-                    0.0
-                });
-                let key = (
-                    tokio::time::Instant::now() + duration,
-                    runtime.next_id.fetch_add(1, Ordering::Relaxed),
-                );
-                runtime.timers.lock().unwrap().insert(key, callback);
-                runtime.timer_changed.notify_one();
-                Arc::new(move |_| {
-                    runtime.timers.lock().unwrap().remove(&key);
+            aff_box(AffNode::NativeAsync {
+                yield_after_registration: true,
+                build: Arc::new(move |callback| {
+                    let runtime = aff_runtime();
+                    let duration = std::time::Duration::from_secs_f64(if milliseconds.is_finite() {
+                        milliseconds.max(0.0) / 1000.0
+                    } else {
+                        0.0
+                    });
+                    let key = (
+                        tokio::time::Instant::now() + duration,
+                        runtime.next_id.fetch_add(1, Ordering::Relaxed),
+                    );
+                    runtime.timers.lock().unwrap().insert(key, callback);
                     runtime.timer_changed.notify_one();
-                    aff_unit()
-                })
-            })))
+                    Arc::new(move |_| {
+                        runtime.timers.lock().unwrap().remove(&key);
+                        runtime.timer_changed.notify_one();
+                        aff_unit()
+                    })
+                }),
+            })
         },
     )))
 }
@@ -1239,14 +1265,17 @@ impl AffParRun {
     }
     fn cancel(self: &Arc<Self>, error: AffValue) -> AffNodeRef {
         let run = self.clone();
-        aff_new(AffNode::NativeAsync(Arc::new(move |callback| {
-            let fibers = {
-                let mut state = run.state.lock().unwrap();
-                state.stopped = true;
-                Self::pending(&state.entries, 0)
-            };
-            aff_cancel_wait(aff_kill_many(fibers, error.clone(), callback))
-        })))
+        aff_new(AffNode::NativeAsync {
+            yield_after_registration: false,
+            build: Arc::new(move |callback| {
+                let fibers = {
+                    let mut state = run.state.lock().unwrap();
+                    state.stopped = true;
+                    Self::pending(&state.entries, 0)
+                };
+                aff_cancel_wait(aff_kill_many(fibers, error.clone(), callback))
+            }),
+        })
     }
 }
 
@@ -1319,4 +1348,40 @@ fn aff_run_parallel(parent: &Arc<AffFiber>, root: AffNodeRef, callback: AffCallb
         fiber.start();
     }
     Arc::new(move |error| run.cancel(error))
+}
+
+#[cfg(test)]
+mod resumption_tests {
+    use super::*;
+
+    fn immediate_callback_thread(yield_after_registration: bool) -> std::thread::ThreadId {
+        let (send, receive) = std::sync::mpsc::channel();
+        purust_aff_run_main(|| {
+            let wait = aff_box(AffNode::NativeAsync {
+                yield_after_registration,
+                // Force completion while the initial driver is still registering
+                // the wait. This exercises the zero-delay race deterministically.
+                build: Arc::new(|callback| {
+                    callback(Ok(crate::Value::Unit));
+                    aff_no_cancel()
+                }),
+            });
+            let action = Effect_Aff__bind(wait, purust_core::Func1::Shared(Arc::new(move |_| {
+                send.send(std::thread::current().id()).unwrap();
+                Effect_Aff__pure(crate::Value::Unit)
+            })));
+            aff_run_effect(&Effect_Aff_launchAff_(action))
+        });
+        receive.try_recv().unwrap()
+    }
+
+    #[test]
+    fn early_timer_callback_yields_to_another_thread() {
+        assert_ne!(immediate_callback_thread(true), std::thread::current().id());
+    }
+
+    #[test]
+    fn synchronous_native_callback_stays_on_the_initial_thread() {
+        assert_eq!(immediate_callback_thread(false), std::thread::current().id());
+    }
 }

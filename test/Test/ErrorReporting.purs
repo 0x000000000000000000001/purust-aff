@@ -4,7 +4,7 @@ import Prelude
 import Control.Monad.Error.Class (catchError, throwError)
 import Data.Time.Duration (Milliseconds(..))
 import Effect (Effect)
-import Effect.Aff (delay, finally, forkAff, launchAff_)
+import Effect.Aff (Aff, delay, finally, forkAff, launchAff_, never)
 import Effect.Class (liftEffect)
 import Effect.Console (log)
 import Effect.Exception (error, errorWithName, throwException)
@@ -28,9 +28,7 @@ runScenario scenario = case scenario of
     throwException $ error "synchronous main failure"
   5 -> nativePanic
   6 -> launchAff_ do
-    void $ forkAff do
-      delay (Milliseconds 20.0)
-      liftEffect $ log "surviving child finished"
+    void $ forkAff (never :: Aff Unit)
     liftEffect nativePanic
   7 -> launchAff_ $ catchError
     (liftEffect $ throwException $ error "handled Effect failure")

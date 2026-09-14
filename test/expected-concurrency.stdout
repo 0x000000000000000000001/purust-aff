@@ -1,4 +1,6 @@
 [OK] Aff resumes on distinct Tokio worker threads
+[OK] delay 0 resumptions execute concurrently
+[OK] positive-delay resumptions execute concurrently
 [OK] Aff shared Ref: 8000 atomic modifications
 [OK] original Go AVar stress: 1000 items
 [OK] Aff/AVar: 1000 producers and consumers across suspensions

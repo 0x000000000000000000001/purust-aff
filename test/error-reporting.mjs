@@ -90,7 +90,7 @@ try {
     { id: 3, status: 101, stdout: 'finalized Effect\n', stderr: 'ErreurEffet: effet 🌍\n' },
     { id: 4, status: 101, stdout: 'child finished\n', stderr: 'Error: synchronous main failure\n' },
     { id: 5, status: 101, stdout: '', panic: true },
-    { id: 6, status: 101, stdout: 'surviving child finished\n', panic: true },
+    { id: 6, status: 101, stdout: '', panic: true },
     { id: 7, status: 0, stdout: 'handled Effect\n', stderr: '' },
   ];
   for (const scenario of scenarios) {

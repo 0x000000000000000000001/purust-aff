@@ -15,6 +15,7 @@ import Data.Time.Duration (Milliseconds(..))
 import Data.Traversable (traverse)
 import Effect (Effect)
 import Effect.Aff (Aff, Canceler(..), runAff, runAff_, launchAff, makeAff, try, bracket, generalBracket, delay, forkAff, suspendAff, joinFiber, killFiber, never, supervise, Error, error, message)
+import Effect.Aff.AVar as AVar
 import Effect.Aff.Compat as AC
 import Effect.Class (class MonadEffect, liftEffect)
 import Effect.Console as Console
@@ -440,10 +441,9 @@ test_parallel = assert "parallel" do
     { a: _, b: _ }
       <$> parallel (action "foo")
       <*> parallel (action "bar")
-  delay (Milliseconds 15.0)
-  r1 <- readRef ref
   r2 <- joinFiber f1
-  pure (r1 == "foobar" && r2.a == "foo" && r2.b == "bar")
+  r1 <- readRef ref
+  pure ((r1 == "foobar" || r1 == "barfoo") && r2.a == "foo" && r2.b == "bar")
 
 test_parallel_throw :: Aff Unit
 test_parallel_throw = assert "parallel/throw" $ withTimeout (Milliseconds 100.0) do
@@ -523,28 +523,40 @@ test_parallel_alt_sync = assert "parallel/alt/sync" do
 
 test_parallel_mixed :: Aff Unit
 test_parallel_mixed = assert "parallel/mixed" do
-  ref <- newRef ""
+  ref <- newRef []
+  leftA <- AVar.empty
+  leftC <- AVar.empty
+  rightA <- AVar.empty
+  rightF <- AVar.empty
   let
-    action n s = parallel do
-      delay (Milliseconds n)
-      _ <- modifyRef ref (_ <> s)
+    action suspend s = parallel do
+      suspend
+      _ <- modifyRef ref (_ <> [ s ])
       pure s
+  -- Keep losing branches suspended until the mixed computation cancels them.
+  -- Small differences between timer deadlines do not determine race winners.
   { r1, r2, r3 } <- sequential $
     { r1: _, r2: _, r3: _ }
-      <$> action 10.0 "a"
+      <$> action (delay (Milliseconds 10.0)) "a"
       <*>
-        ( action 15.0 "a"
-            <|> action 12.0 "b"
-            <|> action 16.0 "c"
+        ( action (AVar.take leftA) "a"
+            <|> action (delay (Milliseconds 12.0)) "b"
+            <|> action (AVar.take leftC) "c"
         )
       <*>
-        ( action 15.0 "a"
-            <|> ((<>) <$> action 13.0 "d" <*> action 14.0 "e")
-            <|> action 16.0 "f"
+        ( action (AVar.take rightA) "a"
+            <|> ((<>) <$> action (delay (Milliseconds 13.0)) "d" <*> action (delay (Milliseconds 14.0)) "e")
+            <|> action (AVar.take rightF) "f"
         )
-  delay (Milliseconds 20.0)
+  -- Canceled takers must leave every value available to be taken here.
+  retained <- traverse (\gate -> AVar.put unit gate *> AVar.tryTake gate)
+    [ leftA, leftC, rightA, rightF ]
   r4 <- readRef ref
-  pure (r1 == "a" && r2 == "b" && r3 == "de" && r4 == "abde")
+  pure
+    ( r1 == "a" && r2 == "b" && r3 == "de"
+        && Array.sort r4 == [ "a", "b", "d", "e" ]
+        && retained == Array.replicate 4 (Just unit)
+    )
 
 test_kill_parallel_alt :: Aff Unit
 test_kill_parallel_alt = assert "kill/parallel/alt" do

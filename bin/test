@@ -64,6 +64,7 @@ if [ "$SMOKE" = 1 ]; then
   run_suite smoke test/expected-smoke.stdout
   echo "Summary: Aff smoke passed."
 else
+  cargo test --manifest-path output/purust_output/Cargo.toml -p Purs_Effect_Aff --lib
   run_suite aff test/expected-main.stdout
   "$COMPILER_DIR/bin/purust" --source output --out output/purust_output --main Test.Concurrency --threaded
   run_suite concurrency test/expected-concurrency.stdout
@@ -71,7 +72,7 @@ else
   run_suite lifetime test/expected-lifetime.stdout
   for scenario in 1 2 3; do
     status=0
-    node -e 'const r = require("node:child_process").spawnSync(process.argv[1], [process.argv[2]], { stdio: "inherit", timeout: 120000 }); if (r.error) console.error(r.error.message); process.exit(r.status ?? 1);' \
+    node -e 'const r = require("node:child_process").spawnSync(process.argv[1], [process.argv[2]], { stdio: "inherit", timeout: 15000 }); if (r.error) console.error(r.error.message); process.exit(r.status ?? 1);' \
       output/purust_output/target/debug/purust_output "$scenario" > "output/lifetime-failure-$scenario.stdout" 2> "output/lifetime-failure-$scenario.stderr" || status=$?
     cat "output/lifetime-failure-$scenario.stdout"
     if [ "$status" -ne 101 ]; then
@@ -80,7 +81,7 @@ else
       exit 1
     fi
     expected=test/expected-lifetime-failure.stdout
-    if [ "$scenario" = 3 ]; then expected=test/expected-lifetime.stdout; fi
+    if [ "$scenario" != 1 ]; then expected=test/expected-lifetime-panic.stdout; fi
     diff -u "$expected" "output/lifetime-failure-$scenario.stdout"
     if [ "$scenario" != 1 ]; then
       failure_output=$(< "output/lifetime-failure-$scenario.stderr")
@@ -89,9 +90,13 @@ else
         exit 1
       fi
     fi
-    printf '[OK] lifetime failure %s reaches process after remaining children finish\n' "$scenario"
+    if [ "$scenario" = 1 ]; then
+      echo '[OK] Aff failure reaches process after remaining children finish'
+    else
+      printf '[OK] Rust panic scenario %s reaches process with pending children\n' "$scenario"
+    fi
   done
   echo "=== Checking uncaught error reporting with fresh TAST ==="
   PURS="$PURS_BIN" node test/error-reporting.mjs
-  echo "Summary: 45 Aff checks, concurrent Ref/AVar integration, child lifetime checks and 9 error-reporting scenarios passed."
+  echo "Summary: 45 Aff checks, early-callback and concurrent timer checks, Ref/AVar integration, child lifetime checks and 9 error-reporting scenarios passed."
 fi

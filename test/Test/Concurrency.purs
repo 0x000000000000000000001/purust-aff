@@ -3,9 +3,10 @@ module Test.Concurrency where
 import Prelude
 import Data.Array as Array
 import Data.Either (Either(..))
+import Data.Time.Duration (Milliseconds(..))
 import Data.Traversable (traverse, traverse_)
 import Effect (Effect, forE)
-import Effect.Aff (Aff, launchAff_, makeAff, forkAff, joinFiber, never, supervise)
+import Effect.Aff (Aff, delay, launchAff_, makeAff, forkAff, joinFiber, never, supervise)
 import Effect.Aff.AVar as AVar
 import Effect.Class (liftEffect)
 import Effect.Console (log)
@@ -18,26 +19,49 @@ foreign import rendezvous :: Effect Rendezvous
 foreign import arrive :: Rendezvous -> Effect Unit
 foreign import threadCount :: Rendezvous -> Effect Int
 foreign import enqueue :: Effect Unit -> Effect Unit
+foreign import data CallbackGate :: Type
+foreign import callbackGate :: Effect CallbackGate
+foreign import enqueueGated :: CallbackGate -> Effect Unit -> Effect Unit
+foreign import releaseCallbacks :: CallbackGate -> Effect Unit
 
--- An external callback may complete from any runtime worker. Timers have their
--- own deterministic ordering, tested by the original Aff suite.
+-- An external callback may complete from any runtime worker.
 workerYield :: Aff Unit
 workerYield = makeAff \done -> do
   enqueue (done (Right unit))
   pure mempty
 
-main :: Effect Unit
-main = launchAff_ do
+workerYieldGated :: CallbackGate -> Aff Unit
+workerYieldGated gate = makeAff \done -> do
+  enqueueGated gate (done (Right unit))
+  pure mempty
+
+-- The first arrival waits for the second before returning. Distinct thread IDs
+-- alone would not prove that the resumptions can execute concurrently.
+assertConcurrentResume :: String -> Aff Unit -> Effect Unit -> Aff Unit
+assertConcurrentResume label suspend afterForks = do
   meeting <- liftEffect rendezvous
-  let visit = workerYield *> liftEffect (arrive meeting)
+  let visit = suspend *> liftEffect (arrive meeting)
   first <- forkAff visit
   second <- forkAff visit
+  liftEffect afterForks
   joinFiber first
   joinFiber second
   count <- liftEffect $ threadCount meeting
   liftEffect do
     assertEqual { actual: count, expected: 2 }
-    log "[OK] Aff resumes on distinct Tokio worker threads"
+    log label
+
+main :: Effect Unit
+main = launchAff_ do
+  gate <- liftEffect callbackGate
+  -- Release external callbacks only after both forks have suspended. A callback
+  -- that fires during makeAff registration may legally resume synchronously.
+  assertConcurrentResume "[OK] Aff resumes on distinct Tokio worker threads"
+    (workerYieldGated gate) (releaseCallbacks gate)
+  assertConcurrentResume "[OK] delay 0 resumptions execute concurrently"
+    (delay (Milliseconds 0.0)) (pure unit)
+  assertConcurrentResume "[OK] positive-delay resumptions execute concurrently"
+    (delay (Milliseconds 10.0)) (pure unit)
 
   ref <- liftEffect $ Ref.new 0
   workers <- traverse forkAff $ Array.replicate 8 do
