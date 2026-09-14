@@ -183,6 +183,42 @@ fn aff_record_panic(runtime: &AffRuntime, panic: Box<dyn std::any::Any + Send>) 
     runtime.changed.notify_one();
 }
 
+// Register native IO before spawning it. Even an abandoned Promise must finish
+// its operation and cleanup before the Aff entry point can exit.
+pub fn purust_aff_spawn_native<F, C>(future: F, complete: C)
+where
+    F: std::future::Future<Output = Result<AffValue, AffValue>> + Send,
+    F: 'static,
+    C: FnOnce(Result<AffValue, AffValue>) + Send + Sync + 'static,
+{
+    let runtime = aff_runtime();
+    runtime.active.fetch_add(1, Ordering::AcqRel);
+    let task = runtime.handle.spawn(future);
+    let executor = runtime.handle.clone();
+    executor.spawn(async move {
+        let result = match task.await {
+            Ok(result) => result,
+            Err(error) => {
+                if error.is_panic() { aff_record_panic(&runtime, error.into_panic()); }
+                Err(Purs_Effect_Exception::Effect_Exception_error("A native IO task terminated unexpectedly".to_owned()))
+            }
+        };
+        let queued = runtime.clone();
+        runtime.microtasks.enqueue(move || {
+            struct Completed(Arc<AffRuntime>);
+            impl Drop for Completed {
+                fn drop(&mut self) {
+                    self.0.active.fetch_sub(1, Ordering::AcqRel);
+                    self.0.changed.notify_one();
+                }
+            }
+            let _completed = Completed(queued.clone());
+            let _scope = AffRuntimeScope::enter(queued);
+            complete(result);
+        });
+    });
+}
+
 pub fn purust_aff_run_main(main: impl FnOnce() -> AffValue) {
     let executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
