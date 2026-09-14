@@ -249,7 +249,9 @@ pub fn purust_aff_run_main(main: impl FnOnce() -> AffValue) {
                     Ok(crate::Value::Unit)
                 }
             };
-        loop {
+        // A Rust panic is fatal even while unrelated fibers or native IO remain
+        // active. Ordinary Aff errors still wait for their normal cleanup below.
+        while runtime.panic.lock().unwrap().is_none() {
             let changed = runtime.changed.notified();
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| aff_try(|| {
                 runtime.microtasks.drain();
@@ -259,7 +261,9 @@ pub fn purust_aff_run_main(main: impl FnOnce() -> AffValue) {
                 Err(panic) => aff_record_panic(&runtime, panic),
                 _ => {},
             }
-            if runtime.active.load(Ordering::Acquire) == 0 && !runtime.microtasks.has_jobs() {
+            if runtime.panic.lock().unwrap().is_some()
+                || (runtime.active.load(Ordering::Acquire) == 0 && !runtime.microtasks.has_jobs())
+            {
                 break;
             }
             changed.await;
