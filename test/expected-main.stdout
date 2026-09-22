@@ -36,6 +36,8 @@
 [OK] efffn
 [OK] fiber/map
 [OK] fiber/apply
+[OK] scheduler
+[OK] par/traverse-order
 [OK] parallel/stack
 [OK] regression/return-fork
 [OK] regression/par-apply-async-canceler

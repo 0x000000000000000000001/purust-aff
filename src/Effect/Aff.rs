@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 type AffValue = crate::UnknownType;
 type AffResult = Result<AffValue, AffValue>;
@@ -142,6 +142,7 @@ impl AffUtil {
 }
 
 struct AffRuntime {
+    pool: Arc<AffPool>,
     microtasks: Arc<purust_core::microtasks::Queue>,
     handle: tokio::runtime::Handle,
     next_id: AtomicUsize,
@@ -152,6 +153,115 @@ struct AffRuntime {
     timers: Mutex<BTreeMap<(tokio::time::Instant, usize), AffCallback>>,
     timer_changed: tokio::sync::Notify,
     panic: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+// Fiber startup no longer runs on the submitting fiber's stack. This bounded
+// pool executes each fiber until its first suspension; Tokio keeps handling
+// waits, timers and resumptions. A dedicated pool is deliberate: CPU work must
+// be limited to a measurable number of workers, unlike the (up to 512-thread)
+// Tokio blocking pool that is also used for resumptions.
+struct AffPoolQueue {
+    jobs: VecDeque<Box<dyn FnOnce() + Send + 'static>>,
+    stop: bool,
+}
+
+struct AffPoolShared {
+    queue: Mutex<AffPoolQueue>,
+    ready: Condvar,
+    handle: tokio::runtime::Handle,
+}
+
+struct AffPool {
+    shared: Arc<AffPoolShared>,
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl AffPool {
+    fn new(workers: usize, handle: tokio::runtime::Handle) -> Arc<Self> {
+        let shared = Arc::new(AffPoolShared {
+            queue: Mutex::new(AffPoolQueue {
+                jobs: VecDeque::new(),
+                stop: false,
+            }),
+            ready: Condvar::new(),
+            handle,
+        });
+        let mut handles = Vec::with_capacity(workers);
+        for index in 0..workers {
+            let worker = shared.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("purust-aff-{index}"))
+                .spawn(move || AffPool::work(worker))
+                .expect("failed to spawn an Aff worker thread");
+            handles.push(handle);
+        }
+        Arc::new(Self {
+            shared,
+            workers: Mutex::new(handles),
+        })
+    }
+    fn work(shared: Arc<AffPoolShared>) {
+        loop {
+            let job = {
+                let mut queue = shared.queue.lock().unwrap();
+                loop {
+                    if queue.stop {
+                        break None;
+                    }
+                    if let Some(job) = queue.jobs.pop_front() {
+                        break Some(job);
+                    }
+                    queue = shared.ready.wait(queue).unwrap();
+                }
+            };
+            match job {
+                Some(job) => {
+                    // Entering the handle keeps `tokio::spawn` working from FFI.
+                    // `block_in_place` still treats this thread as outside the
+                    // runtime and simply blocks it.
+                    let _entered = shared.handle.enter();
+                    job();
+                }
+                None => return,
+            }
+        }
+    }
+    fn submit(&self, job: impl FnOnce() + Send + 'static) {
+        self.shared.queue.lock().unwrap().jobs.push_back(Box::new(job));
+        self.shared.ready.notify_one();
+    }
+}
+
+impl Drop for AffPool {
+    fn drop(&mut self) {
+        {
+            // An orderly shutdown leaves the queue empty: `active` keeps the
+            // entry point alive until every submitted fiber finished. Anything
+            // left (a Rust panic aborted the wait) must not run after the
+            // runtime is gone.
+            let mut queue = self.shared.queue.lock().unwrap();
+            queue.stop = true;
+            queue.jobs.clear();
+        }
+        self.shared.ready.notify_all();
+        if let Ok(mut workers) = self.workers.lock() {
+            for worker in workers.drain(..) {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+fn aff_default_workers() -> usize {
+    std::env::var("PURUST_AFF_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|workers| *workers > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|workers| workers.get().max(2))
+                .unwrap_or(4)
+        })
 }
 
 thread_local! {
@@ -223,6 +333,10 @@ where
 }
 
 pub fn purust_aff_run_main(main: impl FnOnce() -> AffValue) {
+    aff_run_main_with_workers(aff_default_workers(), main)
+}
+
+fn aff_run_main_with_workers(workers: usize, main: impl FnOnce() -> AffValue) {
     let executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -230,6 +344,7 @@ pub fn purust_aff_run_main(main: impl FnOnce() -> AffValue) {
     let changed = Arc::new(tokio::sync::Notify::new());
     let wake = changed.clone();
     let runtime = Arc::new(AffRuntime {
+        pool: AffPool::new(workers.max(1), executor.handle().clone()),
         microtasks: purust_core::microtasks::Queue::new(move || wake.notify_one()),
         handle: executor.handle().clone(),
         next_id: AtomicUsize::new(1),
@@ -392,21 +507,40 @@ impl AffFiber {
                 .insert(self.id, Arc::downgrade(self));
         }
     }
-    fn start(self: &Arc<Self>) {
-        {
-            let mut state = self.state.lock().unwrap();
-            if state.started || state.result.is_some() {
-                return;
-            }
-            state.started = true;
-            self.runtime.active.fetch_add(1, Ordering::AcqRel);
-            self.runtime
-                .fibers
-                .lock()
-                .unwrap()
-                .insert(self.id, self.clone());
+    // Claim the fiber exactly once. Pool submission and inline `event` drives
+    // must agree on one transition, and `active` counts the fiber from the moment
+    // it becomes startable so the entry point cannot exit early.
+    fn begin(self: &Arc<Self>) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.started || state.result.is_some() {
+            return false;
         }
-        self.drive();
+        state.started = true;
+        self.runtime.active.fetch_add(1, Ordering::AcqRel);
+        self.runtime
+            .fibers
+            .lock()
+            .unwrap()
+            .insert(self.id, self.clone());
+        true
+    }
+    // Starting is submitting. Every explicit start site (`forkAff`, `joinFiber`,
+    // `launchAff` and parallel leaves) runs its first instructions on the pool,
+    // so the caller and the new fiber can interleave freely.
+    fn start(self: &Arc<Self>) {
+        if !self.begin() {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let panic_runtime = runtime.clone();
+        let fiber = self.clone();
+        runtime.pool.submit(move || {
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fiber.drive()))
+            {
+                aff_record_panic(&panic_runtime, panic);
+            }
+        });
     }
     fn event(self: &Arc<Self>, event: AffEvent) {
         {
@@ -1343,7 +1477,9 @@ fn aff_run_parallel(parent: &Arc<AffFiber>, root: AffNodeRef, callback: AffCallb
         let run = run.clone();
         fiber.observe(false, Arc::new(move |result| run.settle(index, result)));
     }
-    // Deliberately synchronous: upstream Aff starts each leaf through its first wait.
+    // Every leaf is observed before any of them starts, so a synchronous winner
+    // can still cancel siblings that have not begun. Start order is deliberately
+    // unspecified: `start` hands each leaf to the bounded CPU pool.
     for (_, fiber) in leaves {
         fiber.start();
     }
@@ -1351,17 +1487,107 @@ fn aff_run_parallel(parent: &Arc<AffFiber>, root: AffNodeRef, callback: AffCallb
 }
 
 #[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::{Duration, Instant};
+
+    fn spin_leaf(current: &Arc<AtomicUsize>, peak: &Arc<AtomicUsize>, spin_ms: u64) -> AffNodeRef {
+        let current = current.clone();
+        let peak = peak.clone();
+        aff_new(AffNode::Sync(aff_effect(move || {
+            // Spin long enough that concurrent leaves cannot miss each other by
+            // accident. The peak is the actual proof of overlap.
+            let depth = current.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+            peak.fetch_max(depth, AtomicOrdering::AcqRel);
+            let deadline = Instant::now() + Duration::from_millis(spin_ms);
+            while Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            current.fetch_sub(1, AtomicOrdering::AcqRel);
+            crate::Value::Unit
+        })))
+    }
+
+    // ParApply needs a function on its left, so each added leaf maps the previous
+    // result to a constant `Unit -> Unit`.
+    fn par_tree(leaves: Vec<AffNodeRef>) -> AffNodeRef {
+        let mut par = None;
+        for leaf in leaves {
+            par = Some(match par {
+                None => leaf,
+                Some(left) => {
+                    let function =
+                        aff_new(AffNode::ParMap(aff_fn(|_| aff_fn(|_| crate::Value::Unit)), left));
+                    aff_new(AffNode::ParApply(function, leaf))
+                }
+            });
+        }
+        par.unwrap()
+    }
+
+    fn parallel_peak(workers: usize, outer: usize, inner: usize, spin_ms: u64) -> usize {
+        let current = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        aff_run_main_with_workers(workers, || {
+            let leaves = (0..outer)
+                .map(|_| {
+                    let nested = par_tree(
+                        (0..inner)
+                            .map(|_| spin_leaf(&current, &peak, spin_ms))
+                            .collect(),
+                    );
+                    aff_new(AffNode::Sequential(nested))
+                })
+                .collect();
+            let root = aff_box(AffNode::Sequential(par_tree(leaves)));
+            aff_run_effect(&Effect_Aff_launchAff_(root))
+        });
+        peak.load(AtomicOrdering::Acquire)
+    }
+
+    #[test]
+    fn parallel_synchronous_leaves_overlap() {
+        let peak = parallel_peak(2, 1, 2, 200);
+        assert_eq!(
+            peak, 2,
+            "two independent ParAff leaves must be able to run their synchronous \
+             sections concurrently"
+        );
+    }
+
+    #[test]
+    fn parallel_leaves_respect_the_worker_bound() {
+        let peak = parallel_peak(1, 1, 4, 20);
+        assert_eq!(peak, 1, "a single worker must serialize parallel leaves");
+    }
+
+    #[test]
+    fn nested_parallelism_never_deadlocks() {
+        // Waiting for nested parallelism must release the worker; otherwise two
+        // workers cannot drive sixteen leaves.
+        let peak = parallel_peak(2, 4, 4, 50);
+        assert_eq!(peak, 2);
+    }
+}
+
+#[cfg(test)]
 mod resumption_tests {
     use super::*;
 
-    fn immediate_callback_thread(yield_after_registration: bool) -> std::thread::ThreadId {
+    fn immediate_callback_threads(
+        yield_after_registration: bool,
+    ) -> (std::thread::ThreadId, std::thread::ThreadId) {
         let (send, receive) = std::sync::mpsc::channel();
+        let registered = Arc::new(Mutex::new(None));
         purust_aff_run_main(|| {
+            let registered = registered.clone();
             let wait = aff_box(AffNode::NativeAsync {
                 yield_after_registration,
-                // Force completion while the initial driver is still registering
-                // the wait. This exercises the zero-delay race deterministically.
-                build: Arc::new(|callback| {
+                // Force completion while the driver is still registering the
+                // wait. This exercises the zero-delay race deterministically.
+                build: Arc::new(move |callback| {
+                    *registered.lock().unwrap() = Some(std::thread::current().id());
                     callback(Ok(crate::Value::Unit));
                     aff_no_cancel()
                 }),
@@ -1372,16 +1598,19 @@ mod resumption_tests {
             })));
             aff_run_effect(&Effect_Aff_launchAff_(action))
         });
-        receive.try_recv().unwrap()
+        let registered = registered.lock().unwrap().unwrap();
+        (registered, receive.try_recv().unwrap())
     }
 
     #[test]
     fn early_timer_callback_yields_to_another_thread() {
-        assert_ne!(immediate_callback_thread(true), std::thread::current().id());
+        let (registered, resumed) = immediate_callback_threads(true);
+        assert_ne!(resumed, registered);
     }
 
     #[test]
-    fn synchronous_native_callback_stays_on_the_initial_thread() {
-        assert_eq!(immediate_callback_thread(false), std::thread::current().id());
+    fn synchronous_native_callback_stays_on_the_registration_thread() {
+        let (registered, resumed) = immediate_callback_threads(false);
+        assert_eq!(resumed, registered);
     }
 }

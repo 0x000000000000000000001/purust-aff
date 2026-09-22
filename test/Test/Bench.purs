@@ -8,6 +8,10 @@ import Effect.Aff as Aff
 import Effect.Unsafe (unsafePerformEffect)
 import Effect.Console as Console
 
+-- Note: since fiber starts are free, `launchAff` returns before the action runs,
+-- so these benches now measure only the launch cost. Use `Test.ParBench` (and
+-- `PURUST_AFF_WORKERS`) for CPU-bound `parTraverse` measurements; see `todo.md`.
+
 loop1 :: Int -> Aff.Aff Int
 loop1 = tailRecM go
   where

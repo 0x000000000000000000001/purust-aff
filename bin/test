@@ -18,10 +18,6 @@ if [ ! -x "$SPAGO_BIN" ]; then
   printf 'Missing Spago dependency. Run npm install in %s.\n' "$COMPILER_DIR" >&2
   exit 1
 fi
-if [ "$CLEAN" = 1 ]; then
-  echo "=== Recompiling purust ==="
-  (cd "$COMPILER_DIR" && npm run build)
-fi
 if [ -n "${PURS:-}" ]; then
   PURS_BIN="$(command -v "$PURS")"
 else
@@ -32,7 +28,16 @@ else
     PURS_BIN="$(command -v purs)"
   fi
 fi
-export PATH="$(dirname "$PURS_BIN"):$PATH"
+export PATH="$(dirname "$PURS_BIN"):$COMPILER_DIR/node_modules/.bin:$PATH"
+if [ "$CLEAN" = 1 ]; then
+  echo "=== Recompiling purust ==="
+  # Run Spago directly with the TAST-enabled compiler first on PATH. `npm run
+  # build` would inject ancestor `node_modules/.bin` directories, and an old
+  # PureScript at the workspace root (or the missing local fork download)
+  # would otherwise win.
+  (cd "$COMPILER_DIR" && "$SPAGO_BIN" build \
+    && "$SPAGO_BIN" bundle --module Main --platform node --outfile bin/purust.js --bundle-type app)
+fi
 
 rm -rf output
 if [ "$CLEAN" = 1 ]; then rm -rf .spago .cache; fi
@@ -98,5 +103,5 @@ else
   done
   echo "=== Checking uncaught error reporting with fresh TAST ==="
   PURS="$PURS_BIN" node test/error-reporting.mjs
-  echo "Summary: 45 Aff checks, early-callback and concurrent timer checks, Ref/AVar integration, child lifetime checks and 9 error-reporting scenarios passed."
+  echo "Summary: 47 Aff checks, early-callback and concurrent timer checks, Ref/AVar integration, child lifetime checks and 9 error-reporting scenarios passed."
 fi
