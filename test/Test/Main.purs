@@ -511,8 +511,10 @@ test_parallel_alt = assert "parallel/alt" do
       _ <- modifyRef ref (_ <> s)
       pure s
   f1 <- forkAff $ sequential $
-    parallel (action 10.0 "foo") <|> parallel (action 5.0 "bar")
-  delay (Milliseconds 10.0)
+    parallel (action 50.0 "foo") <|> parallel (action 5.0 "bar")
+  -- Wide margins: the loser is cancelled when "bar" settles, long before the
+  -- parent's own delay elapses.
+  delay (Milliseconds 25.0)
   r1 <- readRef ref
   r2 <- joinFiber f1
   pure (r1 == "bar" && r2 == "bar")
@@ -521,8 +523,8 @@ test_parallel_alt_throw :: Aff Unit
 test_parallel_alt_throw = assert "parallel/alt/throw" do
   r1 <- sequential $
     parallel (delay (Milliseconds 10.0) *> throwError (error "Nope."))
-      <|> parallel (delay (Milliseconds 11.0) $> "foo")
-      <|> parallel (delay (Milliseconds 12.0) $> "bar")
+      <|> parallel (delay (Milliseconds 40.0) $> "foo")
+      <|> parallel (delay (Milliseconds 80.0) $> "bar")
   pure (r1 == "foo")
 
 test_parallel_alt_sync :: Aff Unit
