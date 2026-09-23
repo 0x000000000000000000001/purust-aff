@@ -8,6 +8,16 @@ type AffCallback = Arc<dyn Fn(AffResult) + Send + Sync>;
 type AffCancel = Arc<dyn Fn(AffValue) -> AffNodeRef + Send + Sync>;
 type AffNodeRef = Arc<AffCell>;
 
+// Aff fibers run user code (and release its deeply nested values) on pool
+// workers, so give them the same configurable stack as the program thread.
+fn purust_worker_stack_size() -> usize {
+    std::env::var("PURUST_STACK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|size| *size > 0)
+        .unwrap_or(256 * 1024 * 1024)
+}
+
 // Aff is a reusable description. Only a fiber owns a mutable execution stack.
 enum AffNode {
     Pure(AffValue),
@@ -191,6 +201,7 @@ impl AffPool {
             let worker = shared.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("purust-aff-{index}"))
+                .stack_size(purust_worker_stack_size())
                 .spawn(move || AffPool::work(worker))
                 .expect("failed to spawn an Aff worker thread");
             handles.push(handle);
